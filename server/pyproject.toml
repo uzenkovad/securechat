@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "securechat-server"
+version = "1.0.0"
+description = "Web API лабораторної №6: RSA-ключі та шифрований канал із клієнтом"
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "cryptolib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
