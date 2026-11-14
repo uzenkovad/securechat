@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cryptolib"
-version = "1.0.0"
-description = "Спільна бібліотека лабораторної №6: сервіси RSA та AES і опис протоколу безпечного каналу"
+version = "1.1.0"
+description = "Спільна бібліотека лабораторних №6–7: сервіси RSA та AES і опис протоколу безпечного каналу"
 requires-python = ">=3.10"
 dependencies = ["cryptography>=42"]
 

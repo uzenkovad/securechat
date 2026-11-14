@@ -1,3 +1,3 @@
-from .channel import SecureChannelClient, SecureChannelError, SendResult, Session
+from .channel import SecureChannelClient, SecureChannelError, SendResult, Session, SessionExpiredError
 
-__all__ = ["SecureChannelClient", "SecureChannelError", "SendResult", "Session"]
+__all__ = ["SecureChannelClient", "SecureChannelError", "SendResult", "Session", "SessionExpiredError"]

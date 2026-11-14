@@ -1,3 +1,6 @@
+from datetime import datetime
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -17,8 +20,14 @@ class HandshakeResponse(BaseModel):
 
 
 class EncryptedMessage(BaseModel):
-    encrypted_message: str = Field(description="base64: AES-зашифроване повідомлення")
+    encrypted_message: str = Field(description="base64: AES-зашифрований JSON {data, hash}")
 
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class SessionInfo(BaseModel):
+    session_id: str = Field(description="Ідентифікатор сесії")
+    status: Literal["valid", "invalid"] = Field(description="Стан: valid — дійсна, invalid — термін дії минув")
+    expires_at: datetime = Field(description="Термін дії сесії (UTC)")

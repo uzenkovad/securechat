@@ -39,16 +39,16 @@ def run_console(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="securechat-client", description="Клієнт шифрованого каналу (лабораторна №6)")
+    parser = argparse.ArgumentParser(prog="securechat-client", description="Клієнт шифрованого каналу (лабораторні №6–7)")
     parser.add_argument(
         "--server",
         default=os.environ.get("SERVER_URL", "http://127.0.0.1:8000"),
         help="адреса сервера (за замовчуванням http://127.0.0.1:8000 або змінна SERVER_URL)",
     )
     parser.add_argument(
-        "--reuse-session",
+        "--session-per-message",
         action="store_true",
-        help="не створювати нову сесію для кожного повідомлення (за замовчуванням — як на діаграмі: нова сесія щоразу)",
+        help="створювати нову сесію для кожного повідомлення (за замовчуванням сесія одна, доки не закінчиться її термін дії)",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="не показувати кроки протоколу")
     args = parser.parse_args(argv)
@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  · {message}")
 
     with httpx.Client(base_url=args.server, timeout=10.0) as http:
-        channel = SecureChannelClient(http, reuse_session=args.reuse_session, on_step=show_step)
+        channel = SecureChannelClient(http, reuse_session=not args.session_per_message, on_step=show_step)
         return run_console(channel)
 
 

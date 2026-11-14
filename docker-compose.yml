@@ -5,3 +5,5 @@ services:
       dockerfile: server/Dockerfile
     ports:
       - "8000:8000"
+    environment:
+      SESSION_LIFETIME_MINUTES: "1"

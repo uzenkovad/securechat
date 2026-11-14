@@ -1,21 +1,38 @@
 import io
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from cryptolib import AesService
-from securechat_client import SecureChannelClient, SecureChannelError
+from cryptolib import AesService, RsaService
+from securechat_client import SecureChannelClient, SecureChannelError, SessionExpiredError
 from securechat_client.cli import run_console
 from securechat_server import create_app
 
 FIXED_TIME = datetime(2026, 11, 13, 12, 30, 5, tzinfo=timezone.utc)
 
 
+LIFETIME = timedelta(minutes=1)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = FIXED_TIME
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
 @pytest.fixture(scope="module")
-def app():
-    return create_app(initial_key_count=3, clock=lambda: FIXED_TIME)
+def clock():
+    return Clock()
+
+
+@pytest.fixture(scope="module")
+def app(clock):
+    return create_app(initial_key_count=3, session_lifetime=LIFETIME, clock=clock)
 
 
 @pytest.fixture()
@@ -34,18 +51,18 @@ def test_full_flow_client_to_server_and_back(http):
     assert result.reply == "Привіт!. Received: 2026-11-13 12:30:05 UTC"
     assert result.session_id
     assert 1 <= result.rsa_id <= 3
-    assert len(steps) == 4  # ключ, сесія, підтвердження, відповідь
+    assert len(steps) == 6  # ключ, сесія, підтвердження, хеш, відповідь, перевірка хешу відповіді
 
 
-def test_new_session_for_every_message_by_default(http):
-    client = SecureChannelClient(http)
+def test_session_per_message_mode_creates_new_session_each_time(http):
+    client = SecureChannelClient(http, reuse_session=False)
     first = client.send_message("one")
     second = client.send_message("two")
     assert first.session_id != second.session_id
 
 
-def test_reuse_session_keeps_the_same_session(http):
-    client = SecureChannelClient(http, reuse_session=True)
+def test_same_session_is_reused_by_default(http):
+    client = SecureChannelClient(http)
     first = client.send_message("one")
     second = client.send_message("two")
     assert first.session_id == second.session_id
@@ -115,8 +132,6 @@ def test_tampered_reply_is_reported(app):
             SecureChannelClient(tampering).send_message("hi")
 
 
-
-
 def run_with_inputs(http, inputs, **kwargs):
     answers = iter(inputs)
     out = io.StringIO()
@@ -163,3 +178,107 @@ def test_aes_service_is_shared_between_client_and_server():
     from securechat_server.app import AesService as server_aes
 
     assert server_aes is AesService
+
+
+# --- лабораторна №7 ---
+
+
+def test_expired_session_is_replaced_with_a_new_one(app, clock):
+    clock.now = FIXED_TIME
+    steps = []
+    with TestClient(app) as http:
+        client = SecureChannelClient(http, on_step=steps.append)
+        first = client.send_message("one")
+
+        clock.now = FIXED_TIME + LIFETIME + timedelta(seconds=1)
+        second = client.send_message("two")
+    clock.now = FIXED_TIME
+
+    assert second.session_id != first.session_id
+    assert second.reply.startswith("two. Received:")
+    assert any("440" in step for step in steps)
+
+
+def test_replaced_session_is_listed_as_invalid(app, clock):
+    clock.now = FIXED_TIME
+    with TestClient(app) as http:
+        client = SecureChannelClient(http)
+        client.send_message("one")
+        clock.now = FIXED_TIME + LIFETIME + timedelta(seconds=1)
+        client.send_message("two")
+        sessions = http.get("/api/sessions").json()
+    clock.now = FIXED_TIME
+
+    assert sum(1 for s in sessions if s["status"] == "invalid") >= 1
+    assert sum(1 for s in sessions if s["status"] == "valid") >= 1
+
+
+def test_valid_session_is_reused_until_it_expires(app, clock):
+    clock.now = FIXED_TIME
+    with TestClient(app) as http:
+        client = SecureChannelClient(http)
+        first = client.send_message("one")
+        clock.now = FIXED_TIME + LIFETIME  # рівно на межі сесія ще дійсна
+        second = client.send_message("two")
+    clock.now = FIXED_TIME
+    assert first.session_id == second.session_id
+
+
+def test_client_retries_only_once_if_the_new_session_is_expired_too():
+    public_key = RsaService().generate_crypto_keys().public_key
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/public-key"):
+            return httpx.Response(200, text=public_key, headers={"x-rsa-id": "1"})
+        if request.url.path.endswith("/sessions"):
+            return httpx.Response(200, json={"status": "established"})
+        return httpx.Response(440, json={"detail": "Термін дії сесії закінчився."})
+
+    with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://x") as http:
+        with pytest.raises(SessionExpiredError, match="440"):
+            SecureChannelClient(http).send_message("hi")
+
+    assert sum(path.endswith("/messages") for path in seen) == 2  # одна спроба й один повтор у новій сесії
+    assert sum(path.endswith("/sessions") for path in seen) == 2
+
+
+class TamperingAes(AesService):
+    """Змінює дані у відповіді сервера, не чіпаючи хеш, — наче її підмінили дорогою."""
+
+    def decrypt(self, key, cipher_text):
+        text = super().decrypt(key, cipher_text)
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(parsed, dict) and "hash" in parsed:
+            parsed["data"] += " (підмінено)"
+            return json.dumps(parsed, ensure_ascii=False)
+        return text
+
+
+def test_reply_with_wrong_hash_is_rejected(http):
+    client = SecureChannelClient(http, aes_service=TamperingAes())
+    with pytest.raises(SecureChannelError, match="Хеш відповіді"):
+        client.send_message("hi")
+
+
+def test_console_continues_after_expired_session(app, clock):
+    clock.now = FIXED_TIME
+    answers = iter(["one", "two", "exit"])
+    out = io.StringIO()
+
+    def read(_prompt):
+        value = next(answers)
+        if value == "two":
+            clock.now = FIXED_TIME + LIFETIME + timedelta(seconds=5)
+        return value
+
+    with TestClient(app) as http:
+        run_console(SecureChannelClient(http), read=read, out=out)
+    clock.now = FIXED_TIME
+
+    assert out.getvalue().count("Відповідь сервера:") == 2
+    assert "Помилка" not in out.getvalue()

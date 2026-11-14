@@ -1,21 +1,40 @@
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
-from cryptolib import AesService, HandshakePayload, RsaService
+from cryptolib import AesService, HandshakePayload, HashedMessage, RsaService
 from securechat_server import create_app
 
 FIXED_TIME = datetime(2026, 11, 13, 12, 30, 5, tzinfo=timezone.utc)
+LIFETIME = timedelta(minutes=1)
 
 rsa = RsaService()
 aes = AesService()
 
 
+class Clock:
+    """Годинник, який тест може перемотувати вперед, щоб не чекати справжні хвилини."""
+
+    def __init__(self) -> None:
+        self.now = FIXED_TIME
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
+
+
 @pytest.fixture()
-def client():
-    app = create_app(initial_key_count=3, clock=lambda: FIXED_TIME)
+def clock():
+    return Clock()
+
+
+@pytest.fixture()
+def client(clock):
+    app = create_app(initial_key_count=3, session_lifetime=LIFETIME, clock=clock)
     with TestClient(app) as c:  # with — щоб виконався lifespan (генерація ключів на старті)
         yield c
 
@@ -31,6 +50,18 @@ def open_session(client, session_id="s-1"):
     return session_id, aes_key
 
 
+def post_message(client, session_id, aes_key, text):
+    """Надсилає повідомлення разом із хешем, як це робить клієнт."""
+    cipher = aes.encrypt(aes_key, HashedMessage.create(text).to_json())
+    return client.post(
+        "/api/secure-channel/messages", json={"encrypted_message": cipher}, headers={"x-session-id": session_id}
+    )
+
+
+def read_reply(aes_key, response):
+    reply = HashedMessage.from_json(aes.decrypt(aes_key, response.json()["encrypted_message"]))
+    assert reply.is_valid()
+    return reply.data
 
 
 def test_server_generates_initial_keys_on_startup(client):
@@ -88,8 +119,6 @@ def test_generate_failure_returns_400_with_explanation():
     assert "збій генератора" in r.json()["detail"]
 
 
-
-
 def test_public_key_endpoint_returns_key_and_rsa_id_header(client):
     r = client.get("/api/secure-channel/public-key")
     assert r.status_code == 200
@@ -111,20 +140,15 @@ def test_public_key_endpoint_503_when_no_keys():
 def test_handshake_then_message_roundtrip(client):
     session_id, aes_key = open_session(client)
 
-    cipher = aes.encrypt(aes_key, "Привіт, сервере!")
-    resp = client.post("/api/secure-channel/messages", json={"encrypted_message": cipher}, headers={"x-session-id": session_id})
+    resp = post_message(client, session_id, aes_key, "Привіт, сервере!")
 
     assert resp.status_code == 200
-    assert aes.decrypt(aes_key, resp.json()["encrypted_message"]) == "Привіт, сервере!. Received: 2026-11-13 12:30:05 UTC"
+    assert read_reply(aes_key, resp) == "Привіт, сервере!. Received: 2026-11-13 12:30:05 UTC"
 
 
 def test_reply_is_encrypted_not_plain_text(client):
     session_id, aes_key = open_session(client)
-    resp = client.post(
-        "/api/secure-channel/messages",
-        json={"encrypted_message": aes.encrypt(aes_key, "secret")},
-        headers={"x-session-id": session_id},
-    )
+    resp = post_message(client, session_id, aes_key, "secret")
     assert "secret" not in resp.text and "Received" not in resp.text
 
 
@@ -132,12 +156,8 @@ def test_sessions_are_independent(client):
     s1, k1 = open_session(client, "s-1")
     s2, k2 = open_session(client, "s-2")
     # повідомлення, зашифроване ключем сесії 1, не розшифровується ключем сесії 2
-    resp = client.post(
-        "/api/secure-channel/messages", json={"encrypted_message": aes.encrypt(k1, "hello")}, headers={"x-session-id": s2}
-    )
-    assert resp.status_code in (200, 400)
-    if resp.status_code == 200:
-        assert aes.decrypt(k2, resp.json()["encrypted_message"]) != "hello. Received: 2026-11-13 12:30:05 UTC"
+    resp = post_message(client, s2, k1, "hello")
+    assert resp.status_code == 400
 
 
 def test_handshake_unknown_rsa_id_returns_404(client):
@@ -213,6 +233,147 @@ def test_message_garbage_returns_400(client):
     assert resp.status_code == 400
 
 
+# --- лабораторна №7, завдання 1: термін дії сесії ---
+
+
+def test_session_is_valid_until_its_expiration_time(client, clock):
+    session_id, key = open_session(client)
+    clock.advance(LIFETIME)
+    assert post_message(client, session_id, key, "ще встигаю").status_code == 200
+
+
+def test_expired_session_returns_440(client, clock):
+    session_id, key = open_session(client)
+    clock.advance(LIFETIME + timedelta(seconds=1))
+
+    resp = post_message(client, session_id, key, "запізно")
+
+    assert resp.status_code == 440
+    assert "Термін дії" in resp.json()["detail"]
+
+
+def test_expired_session_stays_expired(client, clock):
+    session_id, key = open_session(client)
+    clock.advance(LIFETIME + timedelta(seconds=1))
+    assert post_message(client, session_id, key, "1").status_code == 440
+    clock.now = FIXED_TIME  # навіть якщо годинник «повернеться», сесія вже позначена недійсною
+    assert post_message(client, session_id, key, "2").status_code == 440
+
+
+def test_session_lifetime_counts_from_creation(client, clock):
+    first, k1 = open_session(client, "first")
+    clock.advance(timedelta(seconds=40))
+    second, k2 = open_session(client, "second")
+    clock.advance(timedelta(seconds=40))  # першій 80 с (минуло), другій 40 с
+
+    assert post_message(client, first, k1, "x").status_code == 440
+    assert post_message(client, second, k2, "x").status_code == 200
+
+
+def test_session_lifetime_is_read_from_environment(monkeypatch, clock):
+    monkeypatch.setenv("SESSION_LIFETIME_MINUTES", "5")
+    with TestClient(create_app(initial_key_count=1, clock=clock)) as c:
+        session_id, key = open_session(c)
+        clock.advance(timedelta(minutes=4, seconds=59))
+        assert post_message(c, session_id, key, "ok").status_code == 200
+        clock.advance(timedelta(seconds=2))
+        assert post_message(c, session_id, key, "late").status_code == 440
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-1"])
+def test_bad_session_lifetime_in_environment_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("SESSION_LIFETIME_MINUTES", value)
+    with pytest.raises(RuntimeError, match="SESSION_LIFETIME_MINUTES"):
+        create_app(initial_key_count=1)
+
+
+def test_default_session_lifetime_is_one_minute(monkeypatch):
+    monkeypatch.delenv("SESSION_LIFETIME_MINUTES", raising=False)
+    assert create_app(initial_key_count=1).state.session_lifetime == timedelta(minutes=1)
+
+
+# --- завдання 2: цілісність даних ---
+
+
+def test_modified_data_is_rejected_with_400(client):
+    session_id, key = open_session(client)
+    honest = HashedMessage.create("переказати 100 грн")
+    forged = HashedMessage(data="переказати 900 грн", hash=honest.hash)  # дані змінено, хеш старий
+
+    resp = client.post(
+        "/api/secure-channel/messages",
+        json={"encrypted_message": aes.encrypt(key, forged.to_json())},
+        headers={"x-session-id": session_id},
+    )
+
+    assert resp.status_code == 400
+    assert "Хеш не збігається" in resp.json()["detail"]
+
+
+def test_message_without_hash_is_rejected_with_400(client):
+    session_id, key = open_session(client)
+    resp = client.post(
+        "/api/secure-channel/messages",
+        json={"encrypted_message": aes.encrypt(key, "просто текст без хешу")},
+        headers={"x-session-id": session_id},
+    )
+    assert resp.status_code == 400
+
+
+def test_server_reply_carries_a_valid_hash(client):
+    session_id, key = open_session(client)
+    reply = HashedMessage.from_json(aes.decrypt(key, post_message(client, session_id, key, "hi").json()["encrypted_message"]))
+    assert reply.is_valid()
+    assert reply.data.startswith("hi. Received:")
+
+
+# --- завдання 3: GET /api/sessions ---
+
+
+def test_sessions_list_is_empty_at_start(client):
+    resp = client.get("/api/sessions")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_sessions_list_shows_id_status_and_expiration(client):
+    open_session(client, "alpha")
+
+    (item,) = client.get("/api/sessions").json()
+
+    assert item["session_id"] == "alpha"
+    assert item["status"] == "valid"
+    assert datetime.fromisoformat(item["expires_at"].replace("Z", "+00:00")) == FIXED_TIME + LIFETIME
+
+
+def test_expiration_time_is_returned_in_utc(client):
+    open_session(client)
+    expires_at = client.get("/api/sessions").json()[0]["expires_at"]
+    assert expires_at.endswith("Z") or expires_at.endswith("+00:00")
+
+
+def test_sessions_list_marks_expired_sessions_invalid(client, clock):
+    open_session(client, "old")
+    clock.advance(timedelta(seconds=45))
+    open_session(client, "new")
+    clock.advance(timedelta(seconds=30))  # old: 75 с (минуло), new: 30 с
+
+    statuses = {s["session_id"]: s["status"] for s in client.get("/api/sessions").json()}
+
+    assert statuses == {"old": "invalid", "new": "valid"}
+
+
+def test_invalid_sessions_are_not_removed_from_the_list(client, clock):
+    open_session(client, "gone")
+    clock.advance(timedelta(hours=1))
+    assert len(client.get("/api/sessions").json()) == 1
+    assert len(client.get("/api/sessions").json()) == 1
+
+
+def test_sessions_list_does_not_leak_keys(client):
+    open_session(client)
+    item = client.get("/api/sessions").json()[0]
+    assert set(item) == {"session_id", "status", "expires_at"}
 
 
 def test_openapi_describes_all_endpoints(client):
@@ -224,6 +385,8 @@ def test_openapi_describes_all_endpoints(client):
     assert "get" in paths["/api/secure-channel/public-key"]
     assert "post" in paths["/api/secure-channel/sessions"]
     assert "post" in paths["/api/secure-channel/messages"]
+    assert "get" in paths["/api/sessions"]
+    assert "440" in paths["/api/secure-channel/messages"]["post"]["responses"]
 
 
 def test_swagger_ui_is_served(client):

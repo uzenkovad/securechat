@@ -16,6 +16,8 @@ from .models import AesKey
 RSA_ID_HEADER = "x-rsa-id"
 # Заголовок: номер сесії, до якої належить секретний ключ AES.
 SESSION_ID_HEADER = "x-session-id"
+# Код відповіді, коли термін дії сесії закінчився (клієнт у цьому разі створює нову сесію).
+SESSION_EXPIRED_STATUS = 440
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 import threading
+from dataclasses import dataclass
+from datetime import datetime
 
 from cryptolib import AesKey, RsaKeys
 
@@ -40,25 +42,52 @@ class KeyStore:
             return len(self._keys)
 
 
+@dataclass
+class Session:
+    """Клієнтська сесія: секретний ключ AES і час, після якого сесія не дійсна."""
+
+    session_id: str
+    aes_key: AesKey
+    created_at: datetime
+    expires_at: datetime
+    invalidated: bool = False
+
+    def is_valid(self, now: datetime) -> bool:
+        return not self.invalidated and now <= self.expires_at
+
+
 class SessionStore:
-    """Секретні ключі AES, прив'язані до номера сесії."""
+    """Сесії за їх номером. Недійсні сесії не видаляються: про них повертає GET /api/sessions."""
 
     def __init__(self) -> None:
-        self._sessions: dict[str, AesKey] = {}
+        self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
 
-    def add(self, session_id: str, key: AesKey) -> bool:
-        """Зберігає ключ сесії. Повертає False, якщо така сесія вже існує
+    def add(self, session: Session) -> bool:
+        """Зберігає сесію. Повертає False, якщо така сесія вже існує
         (її не можна перезаписати, інакше чужу сесію можна було б підмінити)."""
         with self._lock:
-            if session_id in self._sessions:
+            if session.session_id in self._sessions:
                 return False
-            self._sessions[session_id] = key
+            self._sessions[session.session_id] = session
             return True
 
-    def get(self, session_id: str) -> AesKey | None:
+    def get(self, session_id: str) -> Session | None:
         with self._lock:
             return self._sessions.get(session_id)
+
+    def mark_expired(self, now: datetime) -> list[Session]:
+        """Позначає як недійсні всі сесії, термін дії яких минув, і повертає всі сесії."""
+        with self._lock:
+            for session in self._sessions.values():
+                if not session.is_valid(now):
+                    session.invalidated = True
+            return list(self._sessions.values())
+
+    def invalidate(self, session_id: str) -> None:
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id].invalidated = True
 
     def __len__(self) -> int:
         with self._lock:
